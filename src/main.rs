@@ -59,7 +59,16 @@ async fn main() {
     }
 
     loop {
-        let socket = Arc::new(UdpSocket::bind(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, cli.port, 0, 0)).await.unwrap());
+        let socket = Arc::new(
+            UdpSocket::bind(std::net::SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                cli.port,
+                0,
+                0,
+            ))
+            .await
+            .unwrap(),
+        );
         let mut connections = HashMap::<SocketAddr, Connection>::new();
         let mut rooms_map = HashMap::<_, UnboundedSender<_>>::new();
         let mut rooms_tasks = JoinSet::new();
@@ -129,7 +138,7 @@ async fn main() {
                                         eprintln!("Join invalid format: room name is empty string");
                                         continue
                                     }
-                                    let Entry::Vacant(vac) = connections.entry(address.clone()) else { continue };
+                                    let Entry::Vacant(vac) = connections.entry(address) else { continue };
                                     let room = room.to_string();
                                     let messsage_sender = match rooms_map.entry(room.clone()) {
                                         Entry::Occupied(occ)    =>  {
@@ -176,38 +185,62 @@ async fn main() {
                 }
             }
         }
-        eprintln!("Maximum number of connections reached ({} >= {})", connections.len(), cli.limit);
+        eprintln!(
+            "Maximum number of connections reached ({} >= {})",
+            connections.len(),
+            cli.limit
+        );
     }
 }
 
-async fn run_room(socket: Arc<UdpSocket>, initial: SocketAddr, mut messages: UnboundedReceiver<InternalMessage>) {
+async fn run_room(
+    socket: Arc<UdpSocket>,
+    initial: SocketAddr,
+    mut messages: UnboundedReceiver<InternalMessage>,
+) {
     let mut addresses = vec![initial];
     while !addresses.is_empty() || !messages.is_empty() {
         match messages.recv().await {
-            Some(InternalMessage { joining, address: new_address }) => {
-                let mut joined_player_packet = ArrayVec::<u8, {1 + size_of::<Ipv6Addr>() + size_of::<u16>()}>::new();
+            Some(InternalMessage {
+                joining,
+                address: new_address,
+            }) => {
+                let mut joined_player_packet =
+                    ArrayVec::<u8, { 1 + size_of::<Ipv6Addr>() + size_of::<u16>() }>::new();
                 if joining {
                     write_join_packet(&mut joined_player_packet, &new_address);
                     for old_address in addresses.iter().cloned() {
                         let packet = joined_player_packet.clone();
                         let (s1, s2) = (socket.clone(), socket.clone());
-                        tokio::spawn(async move { s1.send_to(&packet, old_address).await.unwrap() });
-                        let mut old_player_packet = ArrayVec::<u8, {1 + size_of::<Ipv6Addr>() + size_of::<u16>()}>::new();
+                        tokio::spawn(
+                            async move { s1.send_to(&packet, old_address).await.unwrap() },
+                        );
+                        let mut old_player_packet =
+                            ArrayVec::<u8, { 1 + size_of::<Ipv6Addr>() + size_of::<u16>() }>::new();
                         write_join_packet(&mut old_player_packet, &old_address);
-                        tokio::spawn(async move { s2.send_to(&old_player_packet, new_address).await.unwrap() });
+                        tokio::spawn(async move {
+                            s2.send_to(&old_player_packet, new_address).await.unwrap()
+                        });
                     }
                     addresses.push(new_address);
                 } else {
                     write_leave_packet(&mut joined_player_packet, &new_address);
-                    addresses.swap_remove(addresses.iter().position(|old_address| new_address == *old_address).unwrap());
+                    addresses.swap_remove(
+                        addresses
+                            .iter()
+                            .position(|old_address| new_address == *old_address)
+                            .unwrap(),
+                    );
                     for destination in addresses.iter().cloned() {
                         let socket = socket.clone();
                         let packet = joined_player_packet.clone();
-                        tokio::spawn(async move { socket.send_to(&packet, destination).await.unwrap() });
+                        tokio::spawn(
+                            async move { socket.send_to(&packet, destination).await.unwrap() },
+                        );
                     }
                 }
             }
-            None    =>  return,
+            None => return,
         }
     }
 }
@@ -260,4 +293,3 @@ fn write_leave_packet<const N: usize>(packet: &mut ArrayVec<u8, N>, address: &So
         }
     }
 }
-
