@@ -33,7 +33,7 @@ struct Cli {
 }
 
 #[derive(Debug)]
-struct ClientMessage {
+struct InternalMessage {
     /// Joining or leaving.
     joining: bool,
     address: SocketAddr,
@@ -41,7 +41,7 @@ struct ClientMessage {
 
 #[derive(Debug)]
 struct Connection {
-    message: UnboundedSender<ClientMessage>,
+    message: UnboundedSender<InternalMessage>,
     refresh: UnboundedSender<()>,
 }
 
@@ -88,7 +88,7 @@ async fn main() {
                                 eprintln!("Attempted to remove missing connection");
                                 break
                             };
-                            removed.message.send(ClientMessage { joining: false, address }).unwrap();
+                            removed.message.send(InternalMessage { joining: false, address }).unwrap();
                             eprintln!("Dropping connection to {}", address);
                         }
                         Err(err) => {
@@ -113,29 +113,27 @@ async fn main() {
                                 Some(1)   =>  {
                                     if buf.len() <= 2 {
                                         eprintln!("Join invalid format: too short (len = {})", buf.len());
-                                    }
-                                    if buf[0] != 1 {
-                                        eprintln!("Join invalid format: buf[0]={} != 1", buf[0]);
-                                        break
+                                        continue
                                     }
                                     let raw_room = &buf[2..];
                                     if buf[1] as usize != raw_room.len() {
                                         eprintln!("Join invalid format: buf[1] != raw_room.len()={}", raw_room.len());
-                                        break
+                                        continue
                                     }
                                     let Ok(room) = std::str::from_utf8(raw_room) else {
                                         eprintln!("Join invalid format: room name not valid UTF-8");
-                                        break
+                                        continue
                                     };
                                     let room = room.trim();
                                     if room.is_empty() {
                                         eprintln!("Join invalid format: room name is empty string");
+                                        continue
                                     }
-                                    let Entry::Vacant(vac) = connections.entry(address.clone()) else { break };
+                                    let Entry::Vacant(vac) = connections.entry(address.clone()) else { continue };
                                     let room = room.to_string();
                                     let messsage_sender = match rooms_map.entry(room.clone()) {
                                         Entry::Occupied(occ)    =>  {
-                                            occ.get().send(ClientMessage { joining: true, address }).unwrap();
+                                            occ.get().send(InternalMessage { joining: true, address }).unwrap();
                                             occ.get().clone()
                                         }
                                         Entry::Vacant(vac) => {
@@ -151,15 +149,11 @@ async fn main() {
                                 }
                                 //  Disconnect from a room
                                 Some(-1)  =>  {
-                                    if buf.len() != 0 {
-                                        eprintln!("Disconnect invalid format: too long (len = {})", buf.len());
-                                        break
-                                    }
                                     let Some(sender) = connections.get(&address) else {
                                         eprintln!("Disconnect: unknown sender {}", address);
-                                        break
+                                        continue
                                     };
-                                    sender.message.send(ClientMessage { joining: false, address }).unwrap();
+                                    sender.message.send(InternalMessage { joining: false, address }).unwrap();
                                 }
                                 //  A keep alive packet
                                 None    =>  {
@@ -186,11 +180,11 @@ async fn main() {
     }
 }
 
-async fn run_room(socket: Arc<UdpSocket>, initial: SocketAddr, mut messages: UnboundedReceiver<ClientMessage>) {
+async fn run_room(socket: Arc<UdpSocket>, initial: SocketAddr, mut messages: UnboundedReceiver<InternalMessage>) {
     let mut addresses = vec![initial];
     while !addresses.is_empty() || !messages.is_empty() {
         match messages.recv().await {
-            Some(ClientMessage { joining, address: new_address }) => {
+            Some(InternalMessage { joining, address: new_address }) => {
                 let mut joined_player_packet = ArrayVec::<u8, {1 + size_of::<Ipv6Addr>() + size_of::<u16>()}>::new();
                 if joining {
                     write_join_packet(&mut joined_player_packet, &new_address);
@@ -213,7 +207,7 @@ async fn run_room(socket: Arc<UdpSocket>, initial: SocketAddr, mut messages: Unb
                     }
                 }
             }
-            None    =>  unreachable!(),
+            None    =>  return,
         }
     }
 }
