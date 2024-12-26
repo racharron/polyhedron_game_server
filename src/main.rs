@@ -61,7 +61,7 @@ async fn main() {
     loop {
         let socket = Arc::new(
             UdpSocket::bind(std::net::SocketAddrV6::new(
-                Ipv6Addr::LOCALHOST,
+                Ipv6Addr::UNSPECIFIED,
                 cli.port,
                 0,
                 0,
