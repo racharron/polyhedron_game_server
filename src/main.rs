@@ -12,7 +12,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
-use tokio::time::{interval, sleep, Instant};
+use tokio::time::{interval, sleep};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -59,6 +59,7 @@ async fn main() {
     }
 
     loop {
+        println!("Starting Polyhedron Game hole-punching lobby server.");
         let socket = Arc::new(
             UdpSocket::bind(std::net::SocketAddrV6::new(
                 Ipv6Addr::UNSPECIFIED,
@@ -115,7 +116,6 @@ async fn main() {
                 result = socket.recv_buf_from(&mut buf) => {
                     match result {
                         Ok((read, address)) => {
-                            println!("Received packet from {address}");
                             assert_eq!(read, buf.len());
                             match buf.first().map(|&first| first as i8) {
                                 //  Connect to a room
@@ -155,6 +155,7 @@ async fn main() {
                                     let (refresh_sender, refresh_receiver) = mpsc::unbounded_channel();
                                     timeouts.spawn(timeout(Duration::from_secs_f32(cli.timeout), refresh_receiver).then(move |()| async move { address }));
                                     vac.insert(Connection { message: messsage_sender, refresh: refresh_sender });
+                                    println!("Adding {address} to room {room:?}");
                                 }
                                 //  Disconnect from a room
                                 Some(-1)  =>  {
@@ -163,6 +164,7 @@ async fn main() {
                                         continue
                                     };
                                     sender.message.send(InternalMessage { joining: false, address }).unwrap();
+                                    println!("Disconnecting {address} from room TODO");
                                 }
                                 //  A keep alive packet
                                 None    =>  {
@@ -246,19 +248,15 @@ async fn run_room(
 }
 
 async fn timeout(period: Duration, mut refresh: UnboundedReceiver<()>) {
-    let sleep = sleep(period);
-    tokio::pin!(sleep);
     loop {
         select! {
             biased;
             option = refresh.recv() => {
-                if option.is_some() {
-                    sleep.as_mut().reset(Instant::now() + period);
-                } else {
+                if option.is_none() {
                     return
                 }
             }
-            _ = &mut sleep => {
+            _ = sleep(period) => {
                 return
             }
         }
