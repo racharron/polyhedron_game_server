@@ -2,20 +2,15 @@ use clap::Parser;
 use futures::StreamExt;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot::Receiver;
-use tokio::sync::Mutex;
-use tokio::task::{JoinError, JoinSet};
-use tokio::{join, select};
-use tokio_util::bytes::BufMut;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tracing::{error, info, trace, warn};
 
@@ -28,13 +23,7 @@ struct Cli {
     port: NonZeroU16,
     #[clap(short, long)]
     /// The maximum number of connections before all are dropped.
-    limit: NonZeroUsize, /*
-                         #[clap(short, long, default_value = "0.25")]
-                         /// The time interval between keep alive packets.  In seconds.
-                         interval: f32,
-                         #[clap(short, long, default_value = "1.0")]
-                         /// The timeout since the last packet received from a player before it is considered to be dropped.
-                         timeout: f32,*/
+    limit: NonZeroUsize,
 }
 
 #[derive(Debug)]
@@ -42,12 +31,6 @@ enum RoomMessage {
     Join { room: String, client: NewClient },
     Broadcast { source: SocketAddr, line: String },
     Leave { address: SocketAddr },
-}
-
-#[derive(Debug)]
-struct JoinRoom {
-    room: String,
-    client: NewClient,
 }
 
 #[derive(Debug)]
@@ -74,10 +57,10 @@ async fn main() {
 
     loop {
         info!("Starting server");
-        let mut socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
+        let socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
             .await
             .unwrap();
-        let mut connections_count = Arc::new(AtomicUsize::new(0));
+        let connections_count = Arc::new(AtomicUsize::new(0));
         while connections_count.load(Ordering::Relaxed) < cli.limit.get() {
             let (stream, address) = socket.accept().await.unwrap();
             tokio::spawn(new_client(stream, address, rooms_sender.clone()));
@@ -100,7 +83,9 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
                 let line = Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()));
                 for address in &*old {
                     clients[&address].line_sender.send(line.clone()).unwrap();
-                    line_sender.send(Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()))).unwrap()
+                    line_sender
+                        .send(Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port())))
+                        .unwrap()
                 }
                 clients.insert(address, Client { room, line_sender });
                 old.push(address);
@@ -224,7 +209,7 @@ async fn to_client(
     write.shutdown().await.unwrap();
 }
 */
-async fn new_client(mut stream: TcpStream, remote: SocketAddr, rooms: UnboundedSender<RoomMessage>) {
+async fn new_client(stream: TcpStream, remote: SocketAddr, rooms: UnboundedSender<RoomMessage>) {
     let (read, write) = stream.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
 
@@ -249,87 +234,3 @@ async fn new_client(mut stream: TcpStream, remote: SocketAddr, rooms: UnboundedS
         }
     }
 }
-
-/*
-async fn run_room(
-    mut lines: FramedRead<OwnedReadHalf, LinesCodec>,
-    mut clients: &mut HashMap<SocketAddr,
-    Arc<Mutex<OwnedWriteHalf>>>
-) {
-    loop {
-        match lines.next().await {
-            Some(Err(LinesCodecError::MaxLineLengthExceeded)) => unreachable!(),
-            Some(Err(LinesCodecError::Io(error))) => {
-                error!(%error, "IO error getting line");
-                break
-            }
-            None => break,
-            Some(Ok(mut line)) => {
-                line.push('\n');
-                let mut set = JoinSet::new();
-                for (address, write) in clients {
-                    let (address, mut write) = (address.clone(), write.clone());
-                    let bytes: Box<_> = line.as_bytes().into();
-                    set.spawn(async move {
-                        let mut write = write.lock().await;
-                        match write.write(&bytes).await {
-                            Ok(0) => {
-                                error!("Connection to {} closed", address);
-                                Some(address)
-                            }
-                            Err(error) => {
-                                error!(%error, "IO error in writing");
-                                Some(address)
-                            }
-                            Ok(_) => {
-                                write.flush().await.unwrap();
-                                None
-                            }
-                        }
-                    });
-                }
-                while let Some(result) = set.join_next().await {
-                    match result {
-                        Ok(None) => {}
-                        Err(error) => {
-                            error!(%error, "Error joining forwarding");
-                        }
-                        Ok(Some(address)) => {
-                            clients.remove(&address);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}*/
-/*
-fn write_join_packet<const N: usize>(packet: &mut ArrayVec<u8, N>, address: &SocketAddr) {
-    match address {
-        SocketAddr::V4(address) => {
-            packet.push(4);
-            packet.extend(address.ip().octets());
-            packet.extend(address.port().to_be_bytes());
-        }
-        SocketAddr::V6(address) => {
-            packet.push(6);
-            packet.extend(address.ip().octets());
-            packet.extend(address.port().to_be_bytes());
-        }
-    }
-}
-fn write_leave_packet<const N: usize>(packet: &mut ArrayVec<u8, N>, address: &SocketAddr) {
-    match address {
-        SocketAddr::V4(address) => {
-            packet.push(-4 as _);
-            packet.extend(address.ip().octets());
-            packet.extend(address.port().to_be_bytes());
-        }
-        SocketAddr::V6(address) => {
-            packet.push(-6 as _);
-            packet.extend(address.ip().octets());
-            packet.extend(address.port().to_be_bytes());
-        }
-    }
-}
-*/
