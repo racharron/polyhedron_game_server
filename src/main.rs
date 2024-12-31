@@ -170,45 +170,7 @@ async fn client(
     rooms_sender.send(RoomMessage::Leave { address }).unwrap();
     read.into_inner().reunite(write).unwrap().shutdown().await.unwrap();
 }
-/*
-async fn to_client(
-    room_sender: UnboundedSender<RoomMessage>,
-    address: SocketAddr,
-    mut write: OwnedWriteHalf,
-    mut client_receiver: UnboundedReceiver<ClientMessage>,
-) {
-    while let Some(message) = client_receiver.recv().await {
-        match message {
-            ClientMessage::Line(line) => {
-                match write.write(line.as_bytes()).await {
-                    Ok(0) => {
-                        warn!("Failed to write to remote socket {address}");
-                        break
-                    }
-                    Ok(amount) => {
-                        assert_eq!(amount, line.len());
-                        if let Err(error) = write.flush().await {
-                            error!(%error, "Failed to flush to remote socket {address}");
-                            break
-                        }
-                    }
-                    Err(error) => {
-                        error!(%error, "Failed to write to remote socket {address}");
-                        break
-                    }
-                }
-                write.flush().await.unwrap();
-            }
-            ClientMessage::LeavingRoom => {
-                write.shutdown().await.unwrap();
-                return
-            }
-        }
-    }
-    room_sender.send(RoomMessage::Leave { address }).unwrap();
-    write.shutdown().await.unwrap();
-}
-*/
+
 async fn new_client(stream: TcpStream, remote: SocketAddr, rooms: UnboundedSender<RoomMessage>) {
     let (read, write) = stream.into_split();
     let mut lines = FramedRead::new(read, LinesCodec::new());
