@@ -1,18 +1,23 @@
-use arrayvec::ArrayVec;
 use clap::Parser;
-use futures::FutureExt;
+use futures::StreamExt;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::{Ipv6Addr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::future::Future;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::UdpSocket;
-use tokio::select;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinSet;
-use tokio::time::{interval, sleep};
+use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::mpsc::{unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot::Receiver;
+use tokio::sync::Mutex;
+use tokio::task::{JoinError, JoinSet};
+use tokio::{join, select};
+use tokio_util::bytes::BufMut;
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -20,249 +25,285 @@ use tokio::time::{interval, sleep};
 struct Cli {
     #[clap(short, long)]
     /// The port the server listens to.
-    port: u16,
+    port: NonZeroU16,
     #[clap(short, long)]
     /// The maximum number of connections before all are dropped.
-    limit: NonZeroUsize,
-    #[clap(short, long, default_value = "0.25")]
-    /// The time interval between keep alive packets.  In seconds.
-    interval: f32,
-    #[clap(short, long, default_value = "1.0")]
-    /// The timeout since the last packet received from a player before it is considered to be dropped.
-    timeout: f32,
+    limit: NonZeroUsize, /*
+                         #[clap(short, long, default_value = "0.25")]
+                         /// The time interval between keep alive packets.  In seconds.
+                         interval: f32,
+                         #[clap(short, long, default_value = "1.0")]
+                         /// The timeout since the last packet received from a player before it is considered to be dropped.
+                         timeout: f32,*/
 }
 
 #[derive(Debug)]
-struct InternalMessage {
-    /// Joining or leaving.
-    joining: bool,
+enum RoomMessage {
+    Join { room: String, client: NewClient },
+    Broadcast { source: SocketAddr, line: String },
+    Leave { address: SocketAddr },
+}
+
+#[derive(Debug)]
+struct JoinRoom {
+    room: String,
+    client: NewClient,
+}
+
+#[derive(Debug)]
+struct NewClient {
     address: SocketAddr,
+    read: FramedRead<OwnedReadHalf, LinesCodec>,
+    write: OwnedWriteHalf,
 }
 
 #[derive(Debug)]
-struct Connection {
-    message: UnboundedSender<InternalMessage>,
-    refresh: UnboundedSender<()>,
+struct Client {
+    room: String,
+    line_sender: UnboundedSender<Arc<str>>,
 }
 
 #[tokio::main]
 async fn main() {
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new()).unwrap();
+
     let cli = Cli::parse();
 
-    if cli.interval <= 0.0 {
-        eprintln!("Keep alive interval must be greater than 0s");
-        std::process::exit(1);
-    }
-    if cli.timeout <= 0.0 {
-        eprintln!("Timeout must be greater than 0s");
-        std::process::exit(2);
-    }
+    let (rooms_sender, room_receiver) = unbounded_channel();
+    tokio::spawn(sync_rooms(rooms_sender.clone(), room_receiver));
 
     loop {
-        println!("Starting Polyhedron Game hole-punching lobby server.");
-        let socket = Arc::new(
-            UdpSocket::bind(std::net::SocketAddrV6::new(
-                Ipv6Addr::UNSPECIFIED,
-                cli.port,
-                0,
-                0,
-            ))
+        info!("Starting server");
+        let mut socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
             .await
-            .unwrap(),
-        );
-        let mut connections = HashMap::<SocketAddr, Connection>::new();
-        let mut rooms_map = HashMap::<_, UnboundedSender<_>>::new();
-        let mut rooms_tasks = JoinSet::new();
-        let mut timeouts = JoinSet::new();
-        let mut buf = Vec::with_capacity(1024);
-        let mut interval = interval(Duration::from_secs_f32(cli.interval));
-        while connections.len() < cli.limit.get() {
-            buf.clear();
-            select! {
-                biased;
-                free_room = rooms_tasks.join_next(), if !rooms_tasks.is_empty() => {
-                    match free_room.unwrap() {
-                        Ok(free_room) => {
-                            rooms_map.remove(&free_room);
-                        }
-                        Err(err) => {
-                            eprintln!("couldn't free room: {}", err);
-                            break
-                        }
-                    }
-                }
-                address = timeouts.join_next(), if !timeouts.is_empty() => {
-                    match address.unwrap() {
-                        Ok(address) => {
-                            let Some(removed) = connections.remove(&address) else {
-                                eprintln!("Attempted to remove missing connection");
-                                break
-                            };
-                            removed.message.send(InternalMessage { joining: false, address }).unwrap();
-                            eprintln!("Dropping connection to {}", address);
-                        }
-                        Err(err) => {
-                            eprintln!("error in getting timeout: {}", err);
-                            break
-                        }
-                    }
-                }
-                _ = interval.tick() => {
-                    for connection in connections.keys().cloned() {
-                        let socket = socket.clone();
-                        tokio::spawn(async move { socket.send_to(&[], connection).await.unwrap() });
-                    }
-                }
-                result = socket.recv_buf_from(&mut buf) => {
-                    match result {
-                        Ok((read, address)) => {
-                            assert_eq!(read, buf.len());
-                            match buf.first().map(|&first| first as i8) {
-                                //  Connect to a room
-                                Some(1)   =>  {
-                                    if buf.len() <= 2 {
-                                        eprintln!("Join invalid format: too short (len = {})", buf.len());
-                                        continue
-                                    }
-                                    let raw_room = &buf[2..];
-                                    if buf[1] as usize != raw_room.len() {
-                                        eprintln!("Join invalid format: buf[1] != raw_room.len()={}", raw_room.len());
-                                        continue
-                                    }
-                                    let Ok(room) = std::str::from_utf8(raw_room) else {
-                                        eprintln!("Join invalid format: room name not valid UTF-8");
-                                        continue
-                                    };
-                                    let room = room.trim();
-                                    if room.is_empty() {
-                                        eprintln!("Join invalid format: room name is empty string");
-                                        continue
-                                    }
-                                    let Entry::Vacant(vac) = connections.entry(address) else { continue };
-                                    let room = room.to_string();
-                                    let messsage_sender = match rooms_map.entry(room.clone()) {
-                                        Entry::Occupied(occ)    =>  {
-                                            occ.get().send(InternalMessage { joining: true, address }).unwrap();
-                                            occ.get().clone()
-                                        }
-                                        Entry::Vacant(vac) => {
-                                            let (sender, receiver) = mpsc::unbounded_channel();
-                                            let room = room.clone();
-                                            rooms_tasks.spawn(run_room(socket.clone(), address, receiver).then(|()| async move { room }));
-                                            vac.insert(sender).clone()
-                                        }
-                                    };
-                                    let (refresh_sender, refresh_receiver) = mpsc::unbounded_channel();
-                                    timeouts.spawn(timeout(Duration::from_secs_f32(cli.timeout), refresh_receiver).then(move |()| async move { address }));
-                                    vac.insert(Connection { message: messsage_sender, refresh: refresh_sender });
-                                    println!("Adding {address} to room {room:?}");
-                                }
-                                //  Disconnect from a room
-                                Some(-1)  =>  {
-                                    let Some(sender) = connections.get(&address) else {
-                                        eprintln!("Disconnect: unknown sender {}", address);
-                                        continue
-                                    };
-                                    sender.message.send(InternalMessage { joining: false, address }).unwrap();
-                                    println!("Disconnecting {address} from room TODO");
-                                }
-                                //  A keep alive packet
-                                None    =>  {
-                                    let Some(connection) = connections.get(&address) else {
-                                        eprintln!("Received keep alive packet from unknown sender {}", address);
-                                        continue
-                                    };
-                                    connection.refresh.send(()).unwrap();
-                                }
-                                Some(other)   =>  {
-                                    eprintln!("Unrecognized packet type: {} with length {}", other, read);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("Error reading from socket; err={}", err);
-                            break
-                        }
-                    }
-                }
-            }
+            .unwrap();
+        let mut connections_count = Arc::new(AtomicUsize::new(0));
+        while connections_count.load(Ordering::Relaxed) < cli.limit.get() {
+            let (stream, address) = socket.accept().await.unwrap();
+            tokio::spawn(new_client(stream, address, rooms_sender.clone()));
+            connections_count.fetch_add(1, Ordering::Relaxed);
         }
-        eprintln!(
-            "Maximum number of connections reached ({} >= {})",
-            connections.len(),
-            cli.limit
-        );
     }
 }
 
-async fn run_room(
-    socket: Arc<UdpSocket>,
-    initial: SocketAddr,
-    mut messages: UnboundedReceiver<InternalMessage>,
-) {
-    let mut addresses = vec![initial];
-    while !addresses.is_empty() || !messages.is_empty() {
-        match messages.recv().await {
-            Some(InternalMessage {
-                joining,
-                address: new_address,
-            }) => {
-                let mut joined_player_packet =
-                    ArrayVec::<u8, { 1 + size_of::<Ipv6Addr>() + size_of::<u16>() }>::new();
-                if joining {
-                    write_join_packet(&mut joined_player_packet, &new_address);
-                    for old_address in addresses.iter().cloned() {
-                        let packet = joined_player_packet.clone();
-                        let (s1, s2) = (socket.clone(), socket.clone());
-                        tokio::spawn(
-                            async move { s1.send_to(&packet, old_address).await.unwrap() },
-                        );
-                        let mut old_player_packet =
-                            ArrayVec::<u8, { 1 + size_of::<Ipv6Addr>() + size_of::<u16>() }>::new();
-                        write_join_packet(&mut old_player_packet, &old_address);
-                        tokio::spawn(async move {
-                            s2.send_to(&old_player_packet, new_address).await.unwrap()
-                        });
-                    }
-                    addresses.push(new_address);
+async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receiver: UnboundedReceiver<RoomMessage>) {
+    let mut rooms = HashMap::new();
+    let mut clients: HashMap<SocketAddr, Client> = HashMap::new();
+    while let Some(message) = room_receiver.recv().await {
+        match message {
+            RoomMessage::Join {
+                room,
+                client: NewClient { address, read, write },
+            } => {
+                let (line_sender, line_receiver) = unbounded_channel();
+                let old = rooms.entry(room.clone()).or_insert_with(Vec::new);
+                let line = Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()));
+                for address in &*old {
+                    clients[&address].line_sender.send(line.clone()).unwrap();
+                    line_sender.send(Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()))).unwrap()
+                }
+                clients.insert(address, Client { room, line_sender });
+                old.push(address);
+                tokio::spawn(client(rooms_sender.clone(), address, read, write, line_receiver));
+            }
+            RoomMessage::Broadcast { source, line } => {
+                let line = Arc::<str>::from(format!("{},{} {}\n", source.ip(), source.port(), line));
+                for destination in &rooms[&clients[&source].room] {
+                    clients[destination].line_sender.send(line.clone()).unwrap();
+                }
+            }
+            RoomMessage::Leave { address } => {
+                let client = clients.remove(&address).unwrap();
+                let Entry::Occupied(mut occ) = rooms.entry(client.room.clone()) else {
+                    panic!("Missing room {}", client.room)
+                };
+                let i = occ.get().iter().position(|r| r == &address).unwrap();
+                occ.get_mut().swap_remove(i);
+                if occ.get().is_empty() {
+                    occ.remove();
                 } else {
-                    write_leave_packet(&mut joined_player_packet, &new_address);
-                    addresses.swap_remove(
-                        addresses
-                            .iter()
-                            .position(|old_address| new_address == *old_address)
-                            .unwrap(),
-                    );
-                    for destination in addresses.iter().cloned() {
-                        let socket = socket.clone();
-                        let packet = joined_player_packet.clone();
-                        tokio::spawn(
-                            async move { socket.send_to(&packet, destination).await.unwrap() },
-                        );
+                    let line = Arc::<str>::from(format!("{},{} L\n", address.ip(), address.port()));
+                    for address in occ.get() {
+                        clients[&address].line_sender.send(line.clone()).unwrap()
                     }
                 }
             }
-            None => return,
         }
     }
 }
 
-async fn timeout(period: Duration, mut refresh: UnboundedReceiver<()>) {
+async fn client(
+    rooms_sender: UnboundedSender<RoomMessage>,
+    address: SocketAddr,
+    mut read: FramedRead<OwnedReadHalf, LinesCodec>,
+    mut write: OwnedWriteHalf,
+    mut line_receiver: UnboundedReceiver<Arc<str>>,
+) {
     loop {
         select! {
             biased;
-            option = refresh.recv() => {
-                if option.is_none() {
-                    return
+            option = line_receiver.recv() => {
+                let Some(line) = option else {
+                    error!("Client receiver closed");
+                    break
+                };
+                match write.write(line.as_bytes()).await {
+                    Ok(0) => {
+                        warn!("Failed to write to remote socket {address}");
+                        break
+                    }
+                    Ok(amount) => {
+                        assert_eq!(amount, line.len());
+                        trace!("Wrote {amount} bytes from {address}");
+                        if let Err(error) = write.flush().await {
+                            error!(%error, "Failed to flush to remote socket {address}");
+                            break
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, "Failed to write to remote socket {address}");
+                        break
+                    }
+                }
+                write.flush().await.unwrap();
+            }
+            result = read.next() => {
+                match result {
+                    None => break,
+                    Some(Err(LinesCodecError::Io(error))) => {
+                        error!(%error, "IO error receiving from remote socket {address}");
+                        break
+                    },
+                    Some(Err(LinesCodecError::MaxLineLengthExceeded))   =>  unreachable!(),
+                    Some(Ok(line)) => {
+                        rooms_sender.send(RoomMessage::Broadcast { source: address, line }).unwrap()
+                    }
                 }
             }
-            _ = sleep(period) => {
+        }
+    }
+    rooms_sender.send(RoomMessage::Leave { address }).unwrap();
+    read.into_inner().reunite(write).unwrap().shutdown().await.unwrap();
+}
+/*
+async fn to_client(
+    room_sender: UnboundedSender<RoomMessage>,
+    address: SocketAddr,
+    mut write: OwnedWriteHalf,
+    mut client_receiver: UnboundedReceiver<ClientMessage>,
+) {
+    while let Some(message) = client_receiver.recv().await {
+        match message {
+            ClientMessage::Line(line) => {
+                match write.write(line.as_bytes()).await {
+                    Ok(0) => {
+                        warn!("Failed to write to remote socket {address}");
+                        break
+                    }
+                    Ok(amount) => {
+                        assert_eq!(amount, line.len());
+                        if let Err(error) = write.flush().await {
+                            error!(%error, "Failed to flush to remote socket {address}");
+                            break
+                        }
+                    }
+                    Err(error) => {
+                        error!(%error, "Failed to write to remote socket {address}");
+                        break
+                    }
+                }
+                write.flush().await.unwrap();
+            }
+            ClientMessage::LeavingRoom => {
+                write.shutdown().await.unwrap();
                 return
             }
         }
     }
+    room_sender.send(RoomMessage::Leave { address }).unwrap();
+    write.shutdown().await.unwrap();
+}
+*/
+async fn new_client(mut stream: TcpStream, remote: SocketAddr, rooms: UnboundedSender<RoomMessage>) {
+    let (read, write) = stream.into_split();
+    let mut lines = FramedRead::new(read, LinesCodec::new());
+
+    match lines.next().await {
+        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => unreachable!(),
+        Some(Err(LinesCodecError::Io(error))) => {
+            error!(%error, "IO error getting room");
+            return;
+        }
+        None => return,
+        Some(Ok(room)) => {
+            rooms
+                .send(RoomMessage::Join {
+                    room,
+                    client: NewClient {
+                        address: remote,
+                        read: lines,
+                        write,
+                    },
+                })
+                .unwrap();
+        }
+    }
 }
 
+/*
+async fn run_room(
+    mut lines: FramedRead<OwnedReadHalf, LinesCodec>,
+    mut clients: &mut HashMap<SocketAddr,
+    Arc<Mutex<OwnedWriteHalf>>>
+) {
+    loop {
+        match lines.next().await {
+            Some(Err(LinesCodecError::MaxLineLengthExceeded)) => unreachable!(),
+            Some(Err(LinesCodecError::Io(error))) => {
+                error!(%error, "IO error getting line");
+                break
+            }
+            None => break,
+            Some(Ok(mut line)) => {
+                line.push('\n');
+                let mut set = JoinSet::new();
+                for (address, write) in clients {
+                    let (address, mut write) = (address.clone(), write.clone());
+                    let bytes: Box<_> = line.as_bytes().into();
+                    set.spawn(async move {
+                        let mut write = write.lock().await;
+                        match write.write(&bytes).await {
+                            Ok(0) => {
+                                error!("Connection to {} closed", address);
+                                Some(address)
+                            }
+                            Err(error) => {
+                                error!(%error, "IO error in writing");
+                                Some(address)
+                            }
+                            Ok(_) => {
+                                write.flush().await.unwrap();
+                                None
+                            }
+                        }
+                    });
+                }
+                while let Some(result) = set.join_next().await {
+                    match result {
+                        Ok(None) => {}
+                        Err(error) => {
+                            error!(%error, "Error joining forwarding");
+                        }
+                        Ok(Some(address)) => {
+                            clients.remove(&address);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}*/
+/*
 fn write_join_packet<const N: usize>(packet: &mut ArrayVec<u8, N>, address: &SocketAddr) {
     match address {
         SocketAddr::V4(address) => {
@@ -291,3 +332,4 @@ fn write_leave_packet<const N: usize>(packet: &mut ArrayVec<u8, N>, address: &So
         }
     }
 }
+*/
