@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -54,8 +54,6 @@ async fn main() {
     tokio::spawn(sync_rooms(rooms_sender.clone(), room_receiver));
 
     info!("Starting server");
-    trace!("ttrace");
-    debug!("debug");
     let socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
         .await
         .unwrap();
@@ -187,15 +185,14 @@ async fn new_client(stream: TcpStream, remote: SocketAddr, rooms: UnboundedSende
         }
         None => return,
         Some(Ok(room)) => {
-            let result = rooms
-                .send(RoomMessage::Join {
-                    room,
-                    client: NewClient {
-                        address: remote,
-                        read: lines,
-                        write,
-                    },
-                });
+            let result = rooms.send(RoomMessage::Join {
+                room,
+                client: NewClient {
+                    address: remote,
+                    read: lines,
+                    write,
+                },
+            });
             if let Err(e) = result {
                 error!(%e, "Error sending message to room thread");
             }
