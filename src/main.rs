@@ -11,7 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -47,14 +47,15 @@ struct Client {
 
 #[tokio::main]
 async fn main() {
-    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new()).unwrap();
-
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let (rooms_sender, room_receiver) = unbounded_channel();
     tokio::spawn(sync_rooms(rooms_sender.clone(), room_receiver));
 
     info!("Starting server");
+    trace!("ttrace");
+    debug!("debug");
     let socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
         .await
         .unwrap();
@@ -103,9 +104,9 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
                 let i = occ.get().iter().position(|r| r == &address).unwrap();
                 occ.get_mut().swap_remove(i);
                 if occ.get().is_empty() {
+                    // room empty, remove it
+                    trace!("Closing room \"{}\"", client.room);
                     occ.remove();
-                    // this breaks the while loop, ends the room
-                    break
                 } else {
                     let line = Arc::<str>::from(format!("{},{} L\n", address.ip(), address.port()));
                     for address in occ.get() {
@@ -186,7 +187,7 @@ async fn new_client(stream: TcpStream, remote: SocketAddr, rooms: UnboundedSende
         }
         None => return,
         Some(Ok(room)) => {
-            rooms
+            let result = rooms
                 .send(RoomMessage::Join {
                     room,
                     client: NewClient {
@@ -194,8 +195,10 @@ async fn new_client(stream: TcpStream, remote: SocketAddr, rooms: UnboundedSende
                         read: lines,
                         write,
                     },
-                })
-                .unwrap();
+                });
+            if let Err(e) = result {
+                error!(%e, "Error sending message to room thread");
+            }
         }
     }
 }
