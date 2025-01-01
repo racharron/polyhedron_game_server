@@ -104,6 +104,7 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
                 occ.get_mut().swap_remove(i);
                 if occ.get().is_empty() {
                     occ.remove();
+                    // this breaks the while loop, ends the room
                     break
                 } else {
                     let line = Arc::<str>::from(format!("{},{} L\n", address.ip(), address.port()));
