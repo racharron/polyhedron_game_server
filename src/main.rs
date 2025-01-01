@@ -3,8 +3,7 @@ use futures::StreamExt;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -21,9 +20,9 @@ struct Cli {
     #[clap(short, long)]
     /// The port the server listens to.
     port: NonZeroU16,
-    #[clap(short, long)]
-    /// The maximum number of connections before all are dropped.
-    limit: NonZeroUsize,
+    // #[clap(short, long)]
+    // /// The maximum number of connections before all are dropped.
+    // limit: NonZeroUsize,
 }
 
 #[derive(Debug)]
@@ -55,17 +54,14 @@ async fn main() {
     let (rooms_sender, room_receiver) = unbounded_channel();
     tokio::spawn(sync_rooms(rooms_sender.clone(), room_receiver));
 
+    info!("Starting server");
+    let socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
+        .await
+        .unwrap();
+
     loop {
-        info!("Starting server");
-        let socket = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cli.port.get(), 0, 0))
-            .await
-            .unwrap();
-        let connections_count = Arc::new(AtomicUsize::new(0));
-        while connections_count.load(Ordering::Relaxed) < cli.limit.get() {
-            let (stream, address) = socket.accept().await.unwrap();
-            tokio::spawn(new_client(stream, address, rooms_sender.clone()));
-            connections_count.fetch_add(1, Ordering::Relaxed);
-        }
+        let (stream, address) = socket.accept().await.unwrap();
+        tokio::spawn(new_client(stream, address, rooms_sender.clone()));
     }
 }
 
@@ -81,7 +77,7 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
                 let (line_sender, line_receiver) = unbounded_channel();
                 let old = rooms.entry(room.clone()).or_insert_with(Vec::new);
                 let line = Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()));
-                for address in &*old {
+                for address in old.iter() {
                     clients[&address].line_sender.send(line.clone()).unwrap();
                     line_sender
                         .send(Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port())))
@@ -94,7 +90,9 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
             RoomMessage::Broadcast { source, line } => {
                 let line = Arc::<str>::from(format!("{},{} {}\n", source.ip(), source.port(), line));
                 for destination in &rooms[&clients[&source].room] {
-                    clients[destination].line_sender.send(line.clone()).unwrap();
+                    if &source != destination {
+                        clients[destination].line_sender.send(line.clone()).unwrap();
+                    }
                 }
             }
             RoomMessage::Leave { address } => {
@@ -106,6 +104,7 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
                 occ.get_mut().swap_remove(i);
                 if occ.get().is_empty() {
                     occ.remove();
+                    break
                 } else {
                     let line = Arc::<str>::from(format!("{},{} L\n", address.ip(), address.port()));
                     for address in occ.get() {
@@ -154,7 +153,10 @@ async fn client(
             }
             result = read.next() => {
                 match result {
-                    None => break,
+                    None => {
+                        error!("TCP read closed");
+                        break
+                    },
                     Some(Err(LinesCodecError::Io(error))) => {
                         error!(%error, "IO error receiving from remote socket {address}");
                         break
