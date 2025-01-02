@@ -75,6 +75,9 @@ async fn sync_rooms(rooms_sender: UnboundedSender<RoomMessage>, mut room_receive
             } => {
                 let (line_sender, line_receiver) = unbounded_channel();
                 let old = rooms.entry(room.clone()).or_insert_with(Vec::new);
+                if old.is_empty(){
+                    trace!("Creating New Room \"{}\"", room );
+                }
                 let line = Arc::<str>::from(format!("{},{} J\n", address.ip(), address.port()));
                 for address in old.iter() {
                     clients[&address].line_sender.send(line.clone()).unwrap();
